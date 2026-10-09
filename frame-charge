@@ -1,0 +1,247 @@
+#!/bin/sh
+set -eu
+
+SYSFS=${FRAME_CHARGE_SYSFS:-/sys/class/power_supply}
+CONFIG=${FRAME_CHARGE_CONFIG:-/etc/frame-charge/config}
+STATE=${FRAME_CHARGE_STATE:-/run/frame-charge}
+DRY=
+pid=
+
+die() {
+  printf 'frame-charge: %s\n' "$*" >&2
+  exit 1
+}
+
+rd() {
+  read -r _v < "$1" && printf '%s\n' "$_v"
+}
+
+uint() {
+  case $2 in
+    '' | *[!0-9]*) die "$1 must be a whole number, got '$2'" ;;
+  esac
+}
+
+load() {
+  limit=off
+  hysteresis=3
+  interval=30
+  method=auto
+  [ -e "$CONFIG" ] || return 0
+  while IFS='=' read -r k v || [ -n "$k" ]; do
+    case $k in
+      '' | '#'*) ;;
+      limit | hysteresis | interval | method) eval "$k=\$v" ;;
+      *) die "$CONFIG: unknown key '$k'" ;;
+    esac
+  done < "$CONFIG"
+  if [ "$limit" != off ]; then
+    uint limit "$limit"
+    [ "$limit" -ge 1 ] && [ "$limit" -le 100 ] || die "limit must be off or 1-100, got '$limit'"
+  fi
+  uint hysteresis "$hysteresis"
+  uint interval "$interval"
+  [ "$interval" -ge 1 ] || die "interval must be at least 1"
+  case $method in
+    auto | threshold | pause | enable) ;;
+    *) die "method must be auto, threshold, pause or enable, got '$method'" ;;
+  esac
+}
+
+attr_of() {
+  case $1 in
+    threshold) echo charge_control_end_threshold ;;
+    pause) echo charging_pause ;;
+    enable) echo charging_enable ;;
+  esac
+}
+
+find_battery() {
+  battery=
+  for d in "$SYSFS"/*; do
+    [ -r "$d/type" ] && [ -r "$d/capacity" ] || continue
+    if [ "$(rd "$d/type")" = Battery ]; then
+      battery=$d
+      return 0
+    fi
+  done
+  die "no battery under $SYSFS"
+}
+
+find_control() {
+  control=
+  used=
+  if [ "$method" = auto ]; then candidates='threshold pause enable'; else candidates=$method; fi
+  for m in $candidates; do
+    a=$(attr_of "$m")
+    for d in "$SYSFS"/*; do
+      if [ -e "$d/$a" ]; then
+        control=$d/$a
+        used=$m
+        return 0
+      fi
+    done
+  done
+}
+
+rival() {
+  for p in /proc/[0-9]*; do
+    [ -r "$p/comm" ] || continue
+    read -r c < "$p/comm" || continue
+    case $c in
+      deckard_charge*)
+        echo "$c"
+        return 0
+        ;;
+    esac
+  done
+}
+
+contended() {
+  [ -e "$STATE/wrote" ] || return 1
+  read -r f v < "$STATE/wrote"
+  [ "$(rd "$f")" != "$v" ]
+}
+
+plugged() {
+  for d in "$SYSFS"/*; do
+    [ -r "$d/online" ] || continue
+    [ "$(rd "$d/type")" = Battery ] && continue
+    [ "$(rd "$d/online")" = 1 ] && { echo yes; return 0; }
+  done
+  echo no
+}
+
+put() {
+  [ "$(rd "$1")" = "$2" ] && return 0
+  if [ -n "$DRY" ]; then
+    printf 'write %s %s\n' "$1" "$2"
+    return 0
+  fi
+  mkdir -p "$STATE"
+  [ -e "$STATE/orig" ] || printf '%s %s\n' "$1" "$(rd "$1")" > "$STATE/orig"
+  printf '%s\n' "$2" > "$1" || die "cannot write $1"
+  printf '%s %s\n' "$1" "$2" > "$STATE/wrote"
+}
+
+release() {
+  [ -e "$STATE/orig" ] || return 0
+  read -r f v < "$STATE/orig"
+  if [ -n "$DRY" ]; then
+    printf 'write %s %s\n' "$f" "$v"
+    return 0
+  fi
+  printf '%s\n' "$v" > "$f" || die "cannot write $f"
+  rm -f "$STATE/orig" "$STATE/wrote"
+}
+
+apply() {
+  load
+  find_battery
+  find_control
+  [ -n "$control" ] || die "no charge control under $SYSFS (method $method)"
+  if [ -e "$STATE/orig" ]; then
+    read -r f _ < "$STATE/orig"
+    [ "$f" = "$control" ] || release
+  fi
+  if contended; then
+    read -r f v < "$STATE/wrote"
+    r=$(rival)
+    die "$f is $(rd "$f") but frame-charge set it to $v: something else is writing it${r:+ ($r is running)}"
+  fi
+  cap=$(rd "$battery/capacity")
+  st=$(rd "$battery/status")
+  once=
+  if [ -e "$STATE/full" ]; then
+    if [ "$cap" -ge 100 ] || [ "$st" = Full ]; then
+      [ -n "$DRY" ] || rm -f "$STATE/full"
+    else
+      once=1
+    fi
+  fi
+  if [ "$limit" = off ] || [ -n "$once" ]; then
+    release
+    return 0
+  fi
+  case $used in
+    threshold) put "$control" "$limit" ;;
+    pause | enable)
+      if [ "$used" = pause ]; then hold=1 allow=0; else hold=0 allow=1; fi
+      if [ "$cap" -ge "$limit" ]; then
+        put "$control" "$hold"
+      elif [ "$cap" -le $((limit - hysteresis)) ]; then
+        put "$control" "$allow"
+      fi
+      ;;
+  esac
+}
+
+status() {
+  load
+  find_battery
+  find_control
+  printf 'battery=%s\n' "$battery"
+  printf 'capacity=%s\n' "$(rd "$battery/capacity")"
+  printf 'status=%s\n' "$(rd "$battery/status")"
+  printf 'plugged=%s\n' "$(plugged)"
+  printf 'limit=%s\n' "$limit"
+  printf 'hysteresis=%s\n' "$hysteresis"
+  printf 'method=%s\n' "${used:-none}"
+  printf 'control=%s\n' "${control:-none}"
+  if [ -n "$control" ]; then
+    printf 'value=%s\n' "$(rd "$control")"
+    if [ -w "$control" ]; then echo writable=yes; else echo writable=no; fi
+  fi
+  r=$(rival)
+  printf 'rival=%s\n' "${r:-none}"
+  if contended; then echo contended=yes; else echo contended=no; fi
+  if [ -e "$STATE/full" ]; then echo full_once=yes; else echo full_once=no; fi
+  if [ -e "$STATE/orig" ]; then echo holding=yes; else echo holding=no; fi
+}
+
+cleanup() {
+  [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+  release
+}
+
+watch() {
+  r=$(rival)
+  [ -z "$r" ] || printf 'frame-charge: %s also writes charger files; any change it makes to the held value stops frame-charge\n' "$r" >&2
+  trap cleanup EXIT
+  trap 'exit 0' INT TERM
+  while :; do
+    apply
+    sleep "$interval" &
+    pid=$!
+    wait "$pid" || true
+    pid=
+  done
+}
+
+full() {
+  mkdir -p "$STATE"
+  : > "$STATE/full"
+  apply
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: frame-charge status | apply [-n] | watch | full | release
+EOF
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+cmd=$1
+shift
+case $cmd in
+  status) status ;;
+  apply)
+    [ "${1:-}" != -n ] || DRY=1
+    apply
+    ;;
+  watch) watch ;;
+  full) full ;;
+  release) release ;;
+  *) usage ;;
+esac
