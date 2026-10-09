@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+ROOT=${ROOT:-}
+DIR=/etc/frame-charge
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+
+die() {
+  printf 'stock-install: %s\n' "$*" >&2
+  exit 1
+}
+
+ctl() {
+  [ -n "$ROOT" ] || systemctl "$@"
+}
+
+install_all() {
+  [ -r "$HERE/frame-charge" ] || die "no frame-charge next to contrib/"
+  mkdir -p "$ROOT$DIR" "$ROOT/etc/systemd/system" "$ROOT/etc/atomic-update.conf.d"
+  cp "$HERE/frame-charge" "$ROOT$DIR/frame-charge"
+  chmod 755 "$ROOT$DIR/frame-charge"
+  [ -e "$ROOT$DIR/config" ] || printf 'limit=80\n' > "$ROOT$DIR/config"
+  cat > "$ROOT/etc/systemd/system/frame-charge.service" <<EOF
+[Unit]
+Description=Hold the battery at its charge limit
+
+[Service]
+ExecStart=$DIR/frame-charge watch
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  printf '%s/**\n' "$DIR" > "$ROOT/etc/atomic-update.conf.d/frame-charge.conf"
+  ctl daemon-reload
+  ctl enable --now frame-charge.service
+}
+
+remove_all() {
+  ctl disable --now frame-charge.service || true
+  [ -x "$ROOT$DIR/frame-charge" ] && [ -z "$ROOT" ] && "$DIR/frame-charge" release
+  rm -rf "$ROOT$DIR" "$ROOT/etc/systemd/system/frame-charge.service" "$ROOT/etc/atomic-update.conf.d/frame-charge.conf"
+  ctl daemon-reload
+}
+
+case ${1:-} in
+  install) install_all ;;
+  remove) remove_all ;;
+  *)
+    echo 'usage: stock-install install | remove' >&2
+    exit 2
+    ;;
+esac
