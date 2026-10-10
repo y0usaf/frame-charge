@@ -22,6 +22,8 @@
         default = frame-charge;
       });
 
+      nixosModules.default = import ./module.nix self;
+
       apps = eachSystem (pkgs: {
         default = {
           type = "app";

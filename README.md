@@ -47,7 +47,18 @@ The Frame has no standard threshold, so it uses `charging_pause`. The value it r
 
 ## Install
 
-Nix, on the Frame's NixOS: `nix build`, `nix run . -- status`, and a service running `frame-charge watch` with `FRAME_CHARGE_CONFIG` pointing at a store file.
+Nix: `nix build`, `nix run . -- status`.
+
+On the Frame's NixOS, import `nixosModules.default` and set the limit; it runs `frame-charge watch` as a service (restarted after 60 seconds if it stops) and writes the config:
+
+```nix
+{
+  imports = [ frame-charge.nixosModules.default ];
+  frame.charge.limit = 80;
+}
+```
+
+`frame.charge.limit` is `"off"` (no service) or 1-100; `frame.charge.hysteresis` defaults to 3.
 
 Stock SteamOS (untested there), as root, from a checkout:
 
